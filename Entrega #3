@@ -1,0 +1,745 @@
+# ============================================================
+# PIPELINE INICIAL DE VISION ARTIFICIAL PARA RADIOGRAFIAS
+# Proyecto: Clasificacion clasica de imagenes de pulmones
+# ============================================================
+
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+import joblib
+
+from pathlib import Path
+from skimage.feature import hog, local_binary_pattern
+from skimage.feature import graycomatrix, graycoprops
+from sklearn.model_selection import (
+    train_test_split,
+    StratifiedKFold,
+    GridSearchCV
+)
+
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.ensemble import RandomForestClassifier
+
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    classification_report,
+    confusion_matrix,
+    ConfusionMatrixDisplay
+)
+
+
+# ------------------------------------------------------------
+# 1. CONFIGURACION GENERAL
+# ------------------------------------------------------------
+
+DATASET_DIR = Path(r"C:\Users\nicol\OneDrive\Documentos\Vision\fotos\chest_xray\chest_xray")
+
+# Todas las imagenes se llevaran a este tamano.
+TAMANO = (224, 224)
+
+# Extensiones de imagen que vamos a leer.
+EXTENSIONES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+
+# Parametros de LBP.
+LBP_PUNTOS = 8
+LBP_RADIO = 1
+
+# CLAHE se usa solo para la visualizacion en esta primera version.
+# No modifica la imagen original utilizada para extraer caracteristicas.
+
+
+# ------------------------------------------------------------
+# 2. CARGA Y PREPROCESAMIENTO
+# ------------------------------------------------------------
+
+def cargar_imagen(ruta):
+    """
+    Lee una radiografia en escala de grises y la redimensiona.
+    Devuelve la imagen original y la imagen procesada.
+    """
+
+    original = cv2.imread(str(ruta), cv2.IMREAD_GRAYSCALE)
+
+    if original is None:
+        raise ValueError(f"No se pudo leer la imagen: {ruta}")
+
+    procesada = cv2.resize(
+        original,
+        TAMANO,
+        interpolation=cv2.INTER_AREA
+    )
+
+    return original, procesada
+
+
+# ------------------------------------------------------------
+# 3. VISTAS PARA INTERPRETAR LA IMAGEN
+# ------------------------------------------------------------
+
+def visualizar_imagen(original, gris, ruta="Radiografia"):
+    """
+    Muestra:
+    1. Imagen original.
+    2. Imagen redimensionada.
+    3. Contraste mejorado con CLAHE.
+    4. Bordes obtenidos mediante Canny.
+    """
+
+    # CLAHE permite visualizar mejor algunas variaciones locales
+    # de contraste, pero no confirma la presencia de neumonia.
+    clahe = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8)
+    )
+    contraste = clahe.apply(gris)
+
+    # Bordes para explorar estructuras de intensidad.
+    bordes = cv2.Canny(gris, 50, 150)
+
+    imagenes = [
+        (original, "1. Original"),
+        (gris, "2. Escala de grises y tamano fijo"),
+        (contraste, "3. Contraste CLAHE"),
+        (bordes, "4. Bordes Canny")
+    ]
+
+    fig, ejes = plt.subplots(2, 2, figsize=(10, 9))
+
+    for ax, (imagen, titulo) in zip(ejes.ravel(), imagenes):
+        ax.imshow(imagen, cmap="gray", vmin=0, vmax=255)
+        ax.set_title(titulo)
+        ax.axis("off")
+
+    fig.suptitle(str(ruta), fontsize=10)
+    plt.tight_layout()
+    plt.show()
+
+
+# ------------------------------------------------------------
+# 4. MODULO HOG: FORMA Y DISTRIBUCION DE BORDES
+# ------------------------------------------------------------
+
+def extraer_hog(gris):
+    """
+    Calcula un descriptor HOG.
+    Resume orientaciones de gradientes en regiones locales.
+    """
+
+    imagen_float = gris.astype(np.float32) / 255.0
+
+    caracteristicas = hog(
+        imagen_float,
+        orientations=9,
+        pixels_per_cell=(16, 16),
+        cells_per_block=(2, 2),
+        block_norm="L2-Hys",
+        visualize=False,
+        feature_vector=True
+    )
+
+    return caracteristicas
+
+
+# ------------------------------------------------------------
+# 5. MODULO LBP: TEXTURA LOCAL
+# ------------------------------------------------------------
+
+def extraer_lbp(gris):
+    """
+    Calcula LBP y construye un histograma normalizado.
+    El histograma resume la frecuencia de los patrones locales.
+    """
+
+    lbp = local_binary_pattern(
+        gris,
+        P=LBP_PUNTOS,
+        R=LBP_RADIO,
+        method="uniform"
+    )
+
+    # Para P=8 y el metodo uniform, usamos P+2 categorias.
+    numero_bins = LBP_PUNTOS + 2
+
+    histograma, _ = np.histogram(
+        lbp.ravel(),
+        bins=np.arange(numero_bins + 1),
+        range=(0, numero_bins)
+    )
+
+    histograma = histograma.astype(np.float32)
+
+    # Frecuencias relativas en lugar de cantidades absolutas.
+    histograma /= (histograma.sum() + 1e-8)
+
+    return histograma, lbp
+
+
+# ------------------------------------------------------------
+# 6. MODULO GLCM: ESTADISTICAS DE TEXTURA
+# ------------------------------------------------------------
+
+def extraer_glcm(gris):
+    """
+    Calcula estadisticas de textura a partir de una GLCM.
+    Reduce los 256 niveles de gris a 32 niveles para el calculo.
+    """
+
+    gris_32 = (gris // 8).astype(np.uint8)
+
+    matriz = graycomatrix(
+        gris_32,
+        distances=[1, 3],
+        angles=[0, np.pi / 4, np.pi / 2, 3 * np.pi / 4],
+        levels=32,
+        symmetric=True,
+        normed=True
+    )
+
+    propiedades = [
+        "contrast",
+        "dissimilarity",
+        "homogeneity",
+        "energy",
+        "correlation",
+        "ASM"
+    ]
+
+    valores = []
+
+    for propiedad in propiedades:
+        # Se promedian las distancias y orientaciones.
+        resultado = graycoprops(matriz, propiedad)
+        valores.append(float(np.mean(resultado)))
+
+    return np.array(valores, dtype=np.float32), propiedades
+
+
+# ------------------------------------------------------------
+# 7. FUSION DE CARACTERISTICAS
+# ------------------------------------------------------------
+
+def extraer_caracteristicas(gris):
+    """
+    Combina HOG + LBP + GLCM en un unico vector numerico.
+    Todavia no realiza ninguna prediccion.
+    """
+
+    hog_vector = extraer_hog(gris)
+    lbp_hist, lbp_mapa = extraer_lbp(gris)
+    glcm_vector, nombres_glcm = extraer_glcm(gris)
+
+    vector = np.concatenate([
+        hog_vector,
+        lbp_hist,
+        glcm_vector
+    ])
+
+    detalles = {
+        "HOG": hog_vector,
+        "LBP": lbp_hist,
+        "LBP_mapa": lbp_mapa,
+        "GLCM": glcm_vector,
+        "nombres_GLCM": nombres_glcm
+    }
+
+    return vector, detalles
+
+
+# ------------------------------------------------------------
+# 8. VISUALIZACION DE CARACTERISTICAS
+# ------------------------------------------------------------
+
+def visualizar_caracteristicas(gris, detalles):
+    """
+    Muestra el mapa LBP y los valores de las propiedades GLCM.
+    HOG se presenta como descriptor numerico.
+    """
+
+    fig, ejes = plt.subplots(1, 2, figsize=(11, 4))
+
+    ejes[0].imshow(detalles["LBP_mapa"], cmap="gray")
+    ejes[0].set_title("Mapa de patrones LBP")
+    ejes[0].axis("off")
+
+    nombres = detalles["nombres_GLCM"]
+    valores = detalles["GLCM"]
+
+    ejes[1].bar(nombres, valores)
+    ejes[1].set_title("Propiedades GLCM")
+    ejes[1].tick_params(axis="x", rotation=45)
+
+    plt.tight_layout()
+    plt.show()
+
+    print("Cantidad de caracteristicas HOG:",
+          len(detalles["HOG"]))
+    print("Cantidad de caracteristicas LBP:",
+          len(detalles["LBP"]))
+    print("Valores GLCM:")
+
+    for nombre, valor in zip(nombres, valores):
+        print(f"  {nombre}: {valor:.5f}")
+
+
+# ------------------------------------------------------------
+# 9. IDENTIFICACION DE LA ETIQUETA DESDE LA CARPETA
+# ------------------------------------------------------------
+
+def obtener_etiqueta(ruta):
+    """
+    Reconoce NORMAL o PNEUMONIA a partir de las carpetas.
+    No intenta diagnosticar la imagen.
+    """
+
+    partes = [parte.lower() for parte in ruta.parts]
+
+    if "normal" in partes:
+        return "NORMAL"
+
+    if "pneumonia" in partes or "neumonia" in partes:
+        return "PNEUMONIA"
+
+    return None
+
+
+# ------------------------------------------------------------
+# 10. CONSTRUIR LA TABLA DE CARACTERISTICAS
+# ------------------------------------------------------------
+
+def construir_dataset(ruta_base):
+    """
+    Recorre las carpetas, procesa las imagenes y construye
+    una tabla con una fila por imagen y una columna por
+    caracteristica.
+
+    Se omiten archivos sin etiqueta reconocible.
+    """
+
+    archivos = [
+        ruta for ruta in ruta_base.rglob("*")
+        if ruta.is_file() and ruta.suffix.lower() in EXTENSIONES
+    ]
+
+    filas = []
+
+    for i, ruta in enumerate(archivos, start=1):
+        etiqueta = obtener_etiqueta(ruta)
+
+        if etiqueta is None:
+            print(f"[SIN ETIQUETA] {ruta.name}")
+            continue
+
+        try:
+            _, gris = cargar_imagen(ruta)
+            vector, detalles = extraer_caracteristicas(gris)
+
+            fila = {
+                f"caracteristica_{j}": valor
+                for j, valor in enumerate(vector)
+            }
+
+            fila["etiqueta"] = etiqueta
+            fila["ruta"] = str(ruta)
+
+            filas.append(fila)
+
+            if i % 100 == 0:
+                print(f"Procesadas {i} imagenes...")
+
+        except (ValueError, cv2.error) as error:
+            print(f"[ERROR] {ruta.name}: {error}")
+
+    return pd.DataFrame(filas)
+
+def preparar_datos(tabla):
+    """
+    Separa los descriptores (X) de las etiquetas (y).
+    Elimina registros incompletos y etiquetas no reconocidas.
+    """
+
+    # Solo las columnas generadas por el extractor.
+    columnas_caracteristicas = [
+        columna for columna in tabla.columns
+        if columna.startswith("caracteristica_")
+    ]
+
+    if not columnas_caracteristicas:
+        raise ValueError(
+            "No se encontraron columnas de características."
+        )
+
+    # X: matriz de características.
+    X = tabla[columnas_caracteristicas].copy()
+
+    # y: clase real de cada imagen.
+    y = tabla["etiqueta"].copy()
+
+    # Eliminar valores numéricos inválidos.
+    X = X.replace([np.inf, -np.inf], np.nan)
+
+    validos = X.notna().all(axis=1) & y.notna()
+
+    X = X.loc[validos].astype(np.float64)
+    y = y.loc[validos].astype(str).str.upper()
+
+    # Solo admitimos las dos clases del proyecto.
+    clases_validas = {"NORMAL", "PNEUMONIA"}
+    mascara_clases = y.isin(clases_validas)
+
+    X = X.loc[mascara_clases]
+    y = y.loc[mascara_clases]
+
+    if y.nunique() != 2:
+        raise ValueError(
+            "Se necesitan las dos clases: NORMAL y PNEUMONIA."
+        )
+
+    if y.value_counts().min() < 2:
+        raise ValueError(
+            "Se requieren al menos dos imágenes por clase "
+            "para realizar una división estratificada."
+        )
+
+    print("Cantidad de imágenes válidas:", len(X))
+    print("\nDistribución de las clases:")
+    print(y.value_counts())
+
+    return X, y
+# ------------------------------------------------------------
+# 11. EJECUCION PRINCIPAL
+# ------------------------------------------------------------
+
+if __name__ == "__main__":
+
+    # A. Verificar la ruta de la biblioteca.
+    if not DATASET_DIR.exists():
+        raise FileNotFoundError(
+            f"No existe la ruta configurada: {DATASET_DIR}"
+        )
+
+    # B. Elegir una radiografia para inspeccionar.
+    imagenes = [
+        ruta for ruta in DATASET_DIR.rglob("*")
+        if ruta.is_file()
+        and ruta.suffix.lower() in EXTENSIONES
+        and obtener_etiqueta(ruta) is not None
+    ]
+
+    if not imagenes:
+        raise RuntimeError(
+            "No se encontraron imagenes etiquetadas como "
+            "NORMAL o PNEUMONIA. Revisa la ruta y las carpetas."
+        )
+
+    muestra = imagenes[0]
+
+    print("Imagen de prueba:", muestra)
+    print("Etiqueta de la carpeta:", obtener_etiqueta(muestra))
+
+    original, gris = cargar_imagen(muestra)
+
+    # C. Mostrar las etapas del preprocesamiento.
+    visualizar_imagen(original, gris, muestra.name)
+
+    # D. Extraer e inspeccionar las caracteristicas.
+    vector, detalles = extraer_caracteristicas(gris)
+
+    print("\nLongitud del vector fusionado:", len(vector))
+    visualizar_caracteristicas(gris, detalles)
+
+    # E. Procesar toda la biblioteca.
+    tabla = construir_dataset(DATASET_DIR)
+
+    if not tabla.empty:
+        salida = DATASET_DIR / "caracteristicas_clasicas.csv"
+        tabla.to_csv(salida, index=False)
+
+        print("\nResumen de etiquetas:")
+        print(tabla["etiqueta"].value_counts())
+
+        print("\nTabla guardada en:", salida)
+        print("Dimensiones de la tabla:", tabla.shape)
+    else:
+        print("No se generaron registros validos.")
+
+
+def dividir_datos(X, y):
+    """
+    Reserva el 20 % de las imágenes para la evaluación final.
+    Mantiene aproximadamente la proporción de las clases.
+    """
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.20,
+        random_state=42,
+        stratify=y
+    )
+
+    print("\nTamaño de los conjuntos:")
+    print("Entrenamiento:", X_train.shape)
+    print("Prueba:", X_test.shape)
+
+    print("\nClases en entrenamiento:")
+    print(y_train.value_counts())
+
+    print("\nClases en prueba:")
+    print(y_test.value_counts())
+
+    return X_train, X_test, y_train, y_test
+
+
+# ============================================================
+# MODULO DE CLASIFICACION Y COMPARACION
+# ============================================================
+
+def entrenar_modelos(X_train, y_train):
+    """
+    Entrena y ajusta k-NN, SVM y Random Forest.
+    La validacion cruzada se realiza solo con entrenamiento.
+    """
+
+    # Cantidad de particiones adaptada a la clase minoritaria.
+    min_clase = int(y_train.value_counts().min())
+    n_splits = min(5, min_clase)
+
+    if n_splits < 2:
+        raise ValueError(
+            "No hay suficientes muestras por clase para "
+            "realizar validacion cruzada."
+        )
+
+    cv = StratifiedKFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=42
+    )
+
+    # La normalizacion se ajusta dentro de cada particion
+    # de entrenamiento durante la validacion cruzada.
+    modelos = {
+        "SVM": (
+            Pipeline([
+                ("escalador", StandardScaler()),
+                ("clasificador", SVC(
+                    class_weight="balanced"
+                ))
+            ]),
+            {
+                "clasificador__kernel": ["linear", "rbf"],
+                "clasificador__C": [0.1, 1, 10]
+            }
+        ),
+
+        "k-NN": (
+            Pipeline([
+                ("escalador", StandardScaler()),
+                ("clasificador", KNeighborsClassifier())
+            ]),
+            {
+                "clasificador__n_neighbors": [3, 5, 7],
+                "clasificador__weights": ["uniform", "distance"]
+            }
+        ),
+
+        "Random Forest": (
+            Pipeline([
+                ("escalador", StandardScaler()),
+                ("clasificador", RandomForestClassifier(
+                    class_weight="balanced",
+                    random_state=42,
+                    n_jobs=-1
+                ))
+            ]),
+            {
+                "clasificador__n_estimators": [100, 200],
+                "clasificador__max_depth": [None, 20]
+            }
+        )
+    }
+
+    resultados = {}
+
+    for nombre, (pipeline, parametros) in modelos.items():
+        print(f"\nEntrenando modelo: {nombre}")
+
+        busqueda = GridSearchCV(
+            estimator=pipeline,
+            param_grid=parametros,
+            scoring="f1_macro",
+            cv=cv,
+            n_jobs=-1,
+            refit=True,
+            error_score="raise"
+        )
+
+        busqueda.fit(X_train, y_train)
+
+        resultados[nombre] = {
+            "modelo": busqueda.best_estimator_,
+            "mejor_f1_cv": busqueda.best_score_,
+            "mejores_parametros": busqueda.best_params_
+        }
+
+        print("Mejor F1 macro en validacion:",
+              round(busqueda.best_score_, 4))
+        print("Mejores parametros:",
+              busqueda.best_params_)
+
+    return resultados
+
+
+# ============================================================
+# EVALUACION SOBRE EL CONJUNTO DE PRUEBA
+# ============================================================
+
+def evaluar_modelos(resultados, X_test, y_test):
+    """
+    Evalua cada modelo sobre el conjunto de prueba.
+    Genera metricas, informes y matrices de confusion.
+    """
+
+    filas_metricas = []
+
+    for nombre, resultado in resultados.items():
+
+        modelo = resultado["modelo"]
+        predicciones = modelo.predict(X_test)
+
+        # Para PNEUMONIA calculamos precision, recall y F1.
+        precision_p = precision_score(
+            y_test, predicciones,
+            pos_label="PNEUMONIA",
+            zero_division=0
+        )
+
+        recall_p = recall_score(
+            y_test, predicciones,
+            pos_label="PNEUMONIA",
+            zero_division=0
+        )
+
+        f1_p = f1_score(
+            y_test, predicciones,
+            pos_label="PNEUMONIA",
+            zero_division=0
+        )
+
+        accuracy = accuracy_score(y_test, predicciones)
+
+        f1_macro = f1_score(
+            y_test, predicciones,
+            average="macro",
+            zero_division=0
+        )
+
+        filas_metricas.append({
+            "Modelo": nombre,
+            "Accuracy": accuracy,
+            "Precision_PNEUMONIA": precision_p,
+            "Recall_PNEUMONIA": recall_p,
+            "F1_PNEUMONIA": f1_p,
+            "F1_macro": f1_macro,
+            "F1_macro_CV": resultado["mejor_f1_cv"]
+        })
+
+        print("\n" + "=" * 55)
+        print("MODELO:", nombre)
+        print("=" * 55)
+
+        print("\nInforme de clasificacion:")
+        print(classification_report(
+            y_test,
+            predicciones,
+            labels=["NORMAL", "PNEUMONIA"],
+            zero_division=0
+        ))
+
+        matriz = confusion_matrix(
+            y_test,
+            predicciones,
+            labels=["NORMAL", "PNEUMONIA"]
+        )
+
+        visualizador = ConfusionMatrixDisplay(
+            confusion_matrix=matriz,
+            display_labels=["NORMAL", "PNEUMONIA"]
+        )
+
+        visualizador.plot(cmap="Blues", values_format="d")
+        plt.title(f"Matriz de confusion - {nombre}")
+        plt.tight_layout()
+        plt.show()
+
+    tabla_resultados = pd.DataFrame(filas_metricas)
+    tabla_resultados = tabla_resultados.sort_values(
+        "F1_macro", ascending=False
+    )
+
+    print("\nCOMPARACION FINAL")
+    print(tabla_resultados.to_string(index=False))
+
+    return tabla_resultados
+
+# ============================================================
+# EJECUCION DEL ENTRENAMIENTO
+# ============================================================
+
+if __name__ == "__main__":
+
+    # 1. Cargar la tabla de caracteristicas existente.
+    archivo_csv = DATASET_DIR / "caracteristicas_clasicas.csv"
+
+    if not archivo_csv.exists():
+        raise FileNotFoundError(
+            "No existe el CSV. Ejecuta primero el pipeline "
+            "de extraccion de caracteristicas."
+        )
+
+    tabla = pd.read_csv(archivo_csv)
+
+    # 2. Preparar X e y.
+    X, y = preparar_datos(tabla)
+
+    # 3. Separar entrenamiento y prueba.
+    X_train, X_test, y_train, y_test = dividir_datos(X, y)
+
+    # 4. Entrenar y ajustar los tres clasificadores.
+    resultados = entrenar_modelos(X_train, y_train)
+
+    # 5. Evaluar los modelos con datos no utilizados
+    #    durante el entrenamiento ni el ajuste.
+    metricas = evaluar_modelos(resultados, X_test, y_test)
+
+    # 6. Guardar la tabla comparativa.
+    archivo_metricas = DATASET_DIR / "metricas_modelos.csv"
+    metricas.to_csv(archivo_metricas, index=False)
+
+    # 7. Guardar el mejor modelo segun F1 macro de validacion.
+    mejor_nombre = max(
+        resultados,
+        key=lambda nombre: resultados[nombre]["mejor_f1_cv"]
+    )
+
+    mejor_modelo = resultados[mejor_nombre]["modelo"]
+
+    joblib.dump(
+        mejor_modelo,
+        DATASET_DIR / "modelo_clasico_neumonia.joblib"
+    )
+
+    print("\nMejor modelo segun validacion cruzada:",
+          mejor_nombre)
+    print("Modelo guardado correctamente.")
